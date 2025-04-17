@@ -7,6 +7,7 @@ from langgraph.graph import StateGraph, START, END
 import re
 import json
 import pandas as pd
+from pydantic import BaseModel
 
 from langchain_core.output_parsers import JsonOutputParser
 from langchain_core.prompts import ChatPromptTemplate
@@ -16,41 +17,29 @@ import os
 from dotenv import load_dotenv, find_dotenv
 from langchain_community.llms import YandexGPT
 
+load_dotenv(find_dotenv())
+YANDEX_TOKEN = os.environ.get("YANDEX_TOKEN")
 
-model = YandexGPT(iam_token="",
+model = YandexGPT(iam_token=YANDEX_TOKEN,
                    folder_id="b1g08itthrid4mko59gr",
                    model_name='yandexgpt',
                    model_version="rc",
                    temperature=0.1,
                    verbose=True)
-# json_parser = JsonOutputParser()
 
-operations = """
-    1-я междурядная культивация
-    2-я междурядная культивация
-    Боронование довсходовое
-    Внесение минеральных удобрений
-    Выравнивание зяби
-    2-е Выравнивание зяби
-    Гербицидная обработка
-    1 Гербицидная обработка
-    2 Гербицидная обработка
-    3 Гербицидная обработка
-    4 Гербицидная обработка
-    Дискование
-    Дискование 2-е
-    Инсектицидная обработка
-    Культивация
-    Пахота
-    Подкормка
-    Предпосевная культивация
-    Прикатывание посевов
-    Сев
-    Сплошная культивация
-    Уборка
-    Функицидная обработка
-    Чизлевание
-    """
+class FormatCheck(BaseModel):
+    date: str
+    department: str
+    operation: str
+    culture: str
+    areaPerDay: float
+    totalArea: float
+    yieldPerDay: float
+    totalYield: float
+
+
+# json_parser = JsonOutputParser()
+operations = pd.read_csv('data/справка-подразделений.csv').to_json(orient="records", force_ascii=False)
 
 crop_сulture_json = {
     "Пшеница озимая товарная": [
@@ -190,26 +179,29 @@ crop_сulture_json = {
     ]
 } 
 
+department = pd.read_csv('data/справка-операции.csv').to_json(orient="records", force_ascii=False)
+
 class State(TypedDict):
     input_message: Optional[str]  # Contains subject, sender, body, etc.
     extract_data: Optional[str]
     messages: List[Dict[str, Any]] 
-    normalize_message_: Optional[str]  
-
+    normalize_message_: Optional[str] 
+    json_entities: Optional[List[Dict[str, Any]]] 
 
 def normalize_message_node(state:State) -> State:
     input_message = state['input_message']
-    normalize_prompt = """
+    normalize_prompt = f"""
     Вы - специализированный ассистент по обработке агрономических данных. Ваша задача - нормализовать сокращенные сообщения, преобразуя сокращенные термины в их полные формы с использованием предоставленных справочных данных.
     Правила нормализации:
     • Культуры: Замените сокращенные названия сельскохозяйственных культур на их полные наименования согласно предоставленному JSON-словарю {crop_сulture_json}. Например:
-    "сах св" → "сахарная свекла"
-    "оз ячмень" → "озимый ячмень"
-    "оз зел корм" → "озимый зеленый корм"
+    "сах св" → "Свекла сахарная"
+    "оз ячмень" → "Ячмень озимый"
+    "кук зерно" → "Кукуруза товарная"
     • Операции: Замените сокращенные названия сельскохозяйственных операций на их полные наименования согласно предоставленному списку {operations}. Например:
-    • Структурные элементы:
-    "Отд" → "Отделение"
-    "По Пу" → "По производственному участку"
+    • Структурные элементы: С помощью json файла {department} тебе нужно поменять написанный структурный элемент на его ПОДРАЗДЕЛЕНИЕ:
+    "Отд_X" → "АОР"; 
+    "По Пу" → "АОР"
+
     Формат данных: Сохраните исходную структуру сообщения, но с нормализованными терминами. Числовые данные (например, "77/518") оставьте без изменений.
     • Контекст: Учитывайте, что данные представляют собой отчеты о сельскохозяйственных работах с указанием:
     Типа операции
@@ -219,36 +211,109 @@ def normalize_message_node(state:State) -> State:
     При нормализации сохраняйте исходное форматирование и структуру данных, изменяя только сокращенные термины на их полные формы согласно предоставленным словарям.
     """
     normalize_message = model.invoke([
-    SystemMessage(content=normalize_prompt.format(operations=operations, crop_сulture_json=crop_сulture_json)),
+    SystemMessage(content=normalize_prompt),
     HumanMessage(content=input_message)
     ])
-    # normalize_message = response[0].content
     print(normalize_message)
     state["normalize_message_"] = normalize_message
     return state
 
+def extract_entities(state:State) -> State:
+    normalize_message = state["normalize_message_"]
+    extract_prompt = """
+    Ты — сервис извлечения структурированных данных.
+    На входе ты получаешь неструктурированное русскоязычное сообщение о полевых работах хозяйства.
+    На выходе ты строго возвращаешь только JSON (без пояснений, комментариев и форматирования Markdown).
+    JSON состоит из массива объектов; один объект описывает одну уникальную комбинацию
+    «Подразделение + Операция + Культура».
+    Объект ДОЛЖЕН содержать ВСЕ перечисленные ниже ключи — даже если значение null.
+    * date — дата формата ДД.ММ.ГГГГ. • Определи её по любому из паттернов ДД.ММ, ДД‑ММ, ДД/ММ, ДД.ММ.ГГ, ДД.ММ.ГГГГ. Если даты нет, то поставь null .
+    * department — название подразделения(например АОР, ТСК, АО Кропоткинское, Восход, Колхоз Прогресс, Мир, СП Коломейцево).
+    * operation — название агрономической операции (существительное; например «Пахота», «Предпосевная культивация», «Дискование»).:
+    * culture - название культуры (существительное; например «Пшеница озимая товарная», «Пшеница озимая семенная», «Соя товарная»).
+    * areaPerDay — площадь (га), выполненная за отчётный день. Число перед косой чертой «/» в записи «XX/YY». Если такого числа нет — null.
+    * totalArea — суммарная площадь (га) «с начала операции» — число после «/» в той же записи. Если нет — null.
+    * yieldPerDay — валовой сбор за день (центнеры, ц). Определи по числам, за которыми сразу следует «ц»/«центнер» и нет символа «/». Если в тексте не указано — null.
+    * totalYield — валовой сбор с начала операции (центнеры, ц). Чаще всего бывает после комбинации «Вал с начала» или второй компонент записи «XX/YY ц». Если не найдено — null.
+    Алгоритм разбора чисел
+    • Игнорируй пробельные символы и символы «→», «-», «•».
+    • Для чисел допускаются запятые как разделитель тысяч «1 234» и точки как десятичная часть «12.5».
+    • Преобразуй итоговые числа к целым, если дробной части нет, иначе к float.
+    Обработка множественных строк вида «Отд 12 26/221»
+    • Если в одном абзаце несколько отделов (несколько «Отд X …»), то формируй JSON ТОЛЬКО для самого первого.
+    Если какой‑то атрибут отсутствует — ставь литерал null (без кавычек).
+    Строго соблюдай порядок ключей в каждом объекте как указан выше.
+    Пример правильного вывода (без форматирования):
+    [ message = "
+    27.10.день
+    Предп культ под оз пш
+    По Пу 215/1015"
+  {
+    "date": "27.10.2024",
+    "department": "АОР",
+    "operation": "Предпосевная культивация",
+    "culture": "Пшеница озимая товарная",
+    "areaPerDay": 215,
+    "totalArea": 1015,
+    "yieldPerDay": null,
+    "totalYield": null
+  }, 
+  message = "
+    20.11 Уборка сах св
+    Отд 12 16/16
+    Вал 473920
+    Урож 296,2
+    Диг - 19,19
+    Оз - 5,33
+    "
+      {
+    "date": "20.11.2024",
+    "department": "АОР",
+    "operation": "Уборка",
+    "culture": "Свекла сахарная",
+    "areaPerDay": 16,
+    "totalArea": 16,
+    "yieldPerDay": 473920,
+    "totalYield": null
+  },]
+    """
+    parser = JsonOutputParser(pydantic_object=FormatCheck)
+    chain = model | parser
+    entities = chain.invoke([
+    SystemMessage(content=extract_prompt),
+    HumanMessage(content=normalize_message)
+    ])
+    print(entities)
+    state["json_entities"] = entities
+    return state
+
+
+
 # Create the graph
 ogr_graph = StateGraph(State)
-
 # Add nodes
 ogr_graph.add_node("normalize_message", normalize_message_node)
-
-
+ogr_graph.add_node("extract_entities", extract_entities)
+extract_entities
 # Start the edges
 ogr_graph.add_edge(START, "normalize_message")
-ogr_graph.add_edge("normalize_message", END)
+ogr_graph.add_edge("normalize_message", "extract_entities")
+
+ogr_graph.add_edge("extract_entities", END)
 
 # Compile the graph
 compiled_graph = ogr_graph.compile()
 
 message = """
-"Пахота зяби под сою
-По Пу 15/1382
-Отд 16 15/775
+Предп культ под оз пш
+По Пу 91/1403
+Отд 11 45/373
+Отд 12 46/363"
 """
 
 compiled_graph.invoke({
     "input_message": message,
     "messages": [],
-    "normalize_message": str
+    "normalize_message": str,
+    "json_entities": {}
 })
