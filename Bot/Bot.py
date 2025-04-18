@@ -24,6 +24,7 @@ async def test(message: types.Message):
     })
     json_entities = response['json_entities'][0]   
     await bot.send_message(message.from_user.id, 'Информация обработана')
+    os.makedirs("excel_test", exist_ok=True)
     toExcel(json_entities)
 
 if __name__ == '__main__':
