@@ -305,10 +305,8 @@ ogr_graph.add_edge("extract_entities", END)
 compiled_graph = ogr_graph.compile()
 
 message = """
-Предп культ под оз пш
-По Пу 91/1403
-Отд 11 45/373
-Отд 12 46/363"
+Всем привет мужики я хуесос.
+Как дела?
 """
 
 compiled_graph.invoke({
